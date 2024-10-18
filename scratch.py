@@ -1,6 +1,13 @@
 import torch
 import torch.nn.functional as F
 import math
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, TensorDataset
+from fancy_einsum import einsum
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
 
 d_vocab = 64
 d = d_head = d_model = 32
@@ -18,13 +25,18 @@ class Transformer(torch.nn.Module):
         self.P = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(n_ctx, d_model)))
         self.P_query = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(n_ctx, d_model)))
 
-
         self.Q = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(d_model, d_model)))
         self.K = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(d_model, d_model)))
         self.V = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(d_model, d_model)))
         self.O = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(d_model, d_model)))
 
         self.U = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(d_model, d_vocab)))
+
+        self.EQKE = None
+        self.EQKP = None
+        self.EVOU = None
+        self.PVOU = None
+        self.direct_path = None
 
 
     def forward(self, input_ids, attention_mask=None):
@@ -33,7 +45,7 @@ class Transformer(torch.nn.Module):
         x = F.one_hot(input_ids, num_classes=d_vocab).squeeze(0).float()
 
         assert x_query.shape == x.shape
-        assert x_query.shape == (n_ctx, d_vocab)
+        # assert x_query.shape == (n_ctx, d_vocab)
 
         # dim=-1 => summing across d_model dimension
         P_avg = torch.sum(self.P) / n_ctx
@@ -50,52 +62,113 @@ class Transformer(torch.nn.Module):
         assert E_q.shape == (d_vocab, d_model)
 
         # Position independent
-        EQKE = E_q @ self.Q @ self.K.T @ E_bar.T
 
-        assert EQKE.shape == (d_vocab, d_vocab)
+        self.EQKE = E_q @ self.Q @ self.K.T @ E_bar.T
+
+        assert self.EQKE.shape == (d_vocab, d_vocab)
 
         # P_hat = P - P_bar
         P_hat = self.P - self.P_query
 
         # Position dependent
-        EQKP = E_q @ self.Q @ self.K.T @ P_hat.T
-        assert EQKP.shape == (d_vocab, n_ctx)   
+        self.EQKP = E_q @ self.Q @ self.K.T @ P_hat.T
+        assert self.EQKP.shape == (d_vocab, n_ctx)   
 
-        QK = x_query @ (EQKE@x.T + EQKP)  
-        print(QK.shape)
+        QK = x_query @ (self.EQKE@x.T + self.EQKP)  
         assert QK.shape == (n_ctx, n_ctx)
 
-        EVOU = E_bar @ self.V @ self.O @ self.U
-        PVOU = P_hat @ self.V @ self.O @ self.U
+        self.EVOU = E_bar @ self.V @ self.O @ self.U
+        self.PVOU = P_hat @ self.V @ self.O @ self.U
 
-        OV = x @ EVOU + PVOU
-        print(OV.shape)
+        OV = x @ self.EVOU + self.PVOU
         assert OV.shape == (n_ctx, d_vocab)
 
-        direct_path = x_query @ (E_q @ self.U)
-        assert direct_path.shape == (n_ctx, d_vocab)
+        self.direct_path = x_query @ (E_q @ self.U)
+        assert self.direct_path.shape == (n_ctx, d_vocab)
 
         # TODO: is this dot product??
         # TODO: (seq_len, seq_len) but which do I softmax over?
-        M = torch.softmax(QK/math.sqrt(d_model), dim=-1) @ OV + direct_path
+        M = torch.softmax(QK/math.sqrt(d_model), dim=-1) @ OV + self.direct_path
         assert M.shape == (n_ctx, d_vocab)
 
-        # TODO: i think
         final_logits = M[-1, :]
         l_max = torch.argmax(final_logits)
-        print(l_max)
+        return M
 
-        
+# Generate random sequences
+num_sequences = 384000
+sequences = torch.randint(0, d_vocab, (num_sequences, n_ctx))
 
+dataset = TensorDataset(sequences)
+# TODO: Batch size of 1 is sus
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-
-    
 model = Transformer()
-# Create dummy inputs
-dummy_input_ids = torch.randint(0, d_vocab, (1, n_ctx))  # Batch size of 1
-dummy_attention_mask = torch.ones(1, n_ctx)  # Full attention for all tokens
+optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
 
-# Invoke the model
-with torch.no_grad():
-    output = model(dummy_input_ids, dummy_attention_mask)
+num_epochs = 1
+num_steps = 3000
 
+for epoch in range(num_epochs):
+    for step, (batch,) in enumerate(dataloader):
+        if step >= num_steps:
+            break
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        input_ids = batch
+        logits = model(input_ids)
+
+        # Compute loss
+        targets = input_ids[:, -1]  # Last token in each sequence
+        loss = F.cross_entropy(logits, input_ids.squeeze())
+
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0:
+            print(f"Epoch: {epoch+1}, Step: {step}, Loss: {loss.item():.4f}")
+
+print("Training completed.")
+
+# Save the trained model
+torch.save(model.state_dict(), "trained_transformer.pth")
+
+def plot_heatmap(matrix, title):
+    # Convert tensor to numpy array if it's not already
+    if hasattr(matrix, 'detach'):
+        matrix = matrix.detach().numpy()
+    
+    # Create custom colormap
+    colors = ['darkred', 'red', 'orange', 'yellow', 'white', 'lightblue', 'blue', 'darkblue']
+    n_bins = 256  # Number of color gradations
+    cmap = LinearSegmentedColormap.from_list("custom", colors, N=n_bins)
+
+    # Create the plot
+    plt.figure(figsize=(10, 8))
+    im = plt.imshow(matrix, cmap=cmap, aspect='auto', 
+                    vmin=np.percentile(matrix, 1), vmax=np.percentile(matrix, 99))
+    
+    # Add colorbar
+    cbar = plt.colorbar(im)
+    cbar.set_label('Attention Score')
+
+    # Set title and labels
+    plt.title(title, fontsize=16)
+    plt.xlabel('Key Position', fontsize=12)
+    plt.ylabel('Query Position', fontsize=12)
+
+    # Add grid lines
+    plt.grid(which='major', color='w', linestyle='-', linewidth=0.5)
+    
+    # Show the plot
+    plt.tight_layout()
+    plt.show()
+
+plot_heatmap(model.EQKE, "EQKE (Position-Independent Attention)")
+plot_heatmap(model.EQKP, "EQKP (Position-Dependent Attention)")
+plot_heatmap(model.EVOU, "EVOU (Value Output)")
+plot_heatmap(model.PVOU, "PVOU (Position-Dependent Output)")
+plot_heatmap(model.direct_path, "Direct Path")
