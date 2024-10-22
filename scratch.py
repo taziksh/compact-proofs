@@ -192,8 +192,10 @@ if __name__ == "__main__":
     print("Training completed.")
     
     # Appendix G.2.3: SVD
+    breakpoint()
     # U, S, V = torch.svd(model.EQKE)
-    # print(torch.diag(S)[0]/torch.diag(S)[1])
+    # print("EQKE")
+    # print(f"Ratio of rank 1 and 2 singular values: {torch.diag(S)[0]/torch.diag(S)[1]}")
 
     # Save the trained model
     torch.save(model.state_dict(), "trained_transformer.pth")
