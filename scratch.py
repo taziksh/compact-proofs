@@ -99,8 +99,8 @@ class Transformer(torch.nn.Module):
 
         # breakpoint()
         # Position independent
-        self.EQKE = scaling_factor * (E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2))
-        # self.EQKE = E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2)
+        # self.EQKE = scaling_factor * (E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2))
+        self.EQKE = E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2)
 
 
         assert self.EQKE.shape == (batch_size, d_vocab, d_vocab)
@@ -111,8 +111,8 @@ class Transformer(torch.nn.Module):
         assert P_hat.shape == (n_ctx, d_model)
 
         # Position dependent
-        self.EQKP = scaling_factor * (E_q @ self.Q @ self.K.T @ P_hat.T)
-        # self.EQKP = E_q @ self.Q @ self.K.T @ P_hat.T
+        # self.EQKP = scaling_factor * (E_q @ self.Q @ self.K.T @ P_hat.T)
+        self.EQKP = E_q @ self.Q @ self.K.T @ P_hat.T
         assert self.EQKP.shape == (batch_size, d_vocab, n_ctx)   
 
         # breakpoint()
