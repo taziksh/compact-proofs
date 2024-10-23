@@ -13,7 +13,7 @@ from matplotlib.colors import LinearSegmentedColormap
 d_vocab = 64
 d = d_head = d_model = 32
 n_ctx = k = 4
-batch_size = 128 #TODO: use batch size 128
+batch_size = 128
 
 #Global seed
 global_seed = 123
@@ -54,7 +54,6 @@ class Transformer(torch.nn.Module):
         super().__init__()
         self.E = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(batch_size, d_vocab, d_model)))
         self.P = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(n_ctx, d_model)))
-        self.P_query = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(n_ctx, d_model)))
 
         self.Q = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(d_model, d_model)))
         self.K = torch.nn.Parameter(torch.nn.init.xavier_uniform_(torch.empty(d_model, d_model)))
@@ -78,48 +77,65 @@ class Transformer(torch.nn.Module):
         x_query = x[:, -1, :] # (batch_size, d_vocab)
         assert x_query.shape == (batch_size, d_vocab)
 
+        P_query = self.P[-1, :]
+
         # dim=-1 => summing across d_model dimension
-        P_avg = torch.mean(self.P, dim=0, keepdim=True)   
+        P_bar = torch.mean(self.P, dim=0, keepdim=True)  
 
-        # breakpoint()
+        assert P_bar.shape == (1, d_model) 
 
-        # Note: P_bar is broadcasted P_avg
+        # Note: P_bar is broadcasted P_bar
+
+        # P_hat = P - P_bar
+        P_hat = self.P - P_bar # (n_ctx, d_model)
+        assert P_hat.shape == (n_ctx, d_model)
 
         # E_bar = E + P_bar
-        E_bar = self.E + P_avg.expand(d_vocab, d_model)
+        E_bar = self.E + P_bar
+
         assert E_bar.shape == (batch_size, d_vocab, d_model)
 
         # E_q = E + P_q
-        # Mean across n_ctx dim, to make it position independent
-        E_q = self.E + self.P_query.mean(dim=0, keepdim=True)
+        P_q = P_query.unsqueeze(0).expand(d_vocab, d_model)
+        E_q = self.E + P_q
         assert E_q.shape == (batch_size, d_vocab, d_model)
-
 
         scaling_factor = 1 / math.sqrt(d_model)
 
-        # breakpoint()
         # Position independent
-        # self.EQKE = scaling_factor * (E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2))
-        self.EQKE = E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2)
-
+        #self.EQKE = E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2)
+        self.EQKE = einsum('batch d_vocab d_model, d_model d_model_2 -> batch d_vocab d_model_2', E_q, self.Q)
+        self.EQKE = einsum('batch d_vocab d_model_2, d_model d_model_2 -> batch d_vocab d_model', self.EQKE, self.K) # TODO: be careful with the dim order for transpose!
+        self.EQKE = einsum('batch d_vocab d_model, batch d_vocab_2 d_model -> batch d_vocab d_vocab_2', self.EQKE, E_bar)
 
         assert self.EQKE.shape == (batch_size, d_vocab, d_vocab)
 
-        # P_hat = P - P_bar
-        #P_hat = self.P - self.P_query
-        P_hat = self.P - P_avg
-        assert P_hat.shape == (n_ctx, d_model)
-
         # Position dependent
         # self.EQKP = scaling_factor * (E_q @ self.Q @ self.K.T @ P_hat.T)
-        self.EQKP = E_q @ self.Q @ self.K.T @ P_hat.T
+        # self.EQKP = E_q @ self.Q @ self.K.T @ P_hat.T
+        self.EQKP = einsum('batch d_vocab d_model, d_model d_model_2 -> batch d_vocab d_model_2', E_q, self.Q)
+        self.EQKP = einsum('batch d_vocab d_model_2, d_model d_model_2 -> batch d_vocab d_model', self.EQKP, self.K)
+        self.EQKP = einsum('batch d_vocab d_model, n_ctx d_model -> batch d_vocab n_ctx', self.EQKP, P_hat)
+
         assert self.EQKP.shape == (batch_size, d_vocab, n_ctx)   
 
-        # breakpoint()
-        QK = x_query @ (self.EQKE @ x.transpose(1, 2) + self.EQKP)
-        QK = einsum('batch d_vocab, batch d_vocab n_ctx -> batch d_vocab n_ctx', x_query, self.EQKE @ x.transpose(1, 2) + self.EQKP)
+        breakpoint()
+
+        #QK = x_query @ (self.EQKE @ x.transpose(1, 2) + self.EQKP)
+        #QK = einsum('batch d_vocab, batch d_vocab n_ctx -> batch d_vocab n_ctx', x_query, self.EQKE @ x.transpose(1, 2) + self.EQKP)
+        QK = einsum('batch d_vocab d_vocab_2, batch n_ctx d_vocab_2 -> batch d_vocab n_ctx', self.EQKE, x) + self.EQKP
         # assert QK.shape == (n_ctx, n_ctx)
-        assert QK.shape == (batch_size, d_vocab, n_ctx)
+        # assert QK.shape == (batch_size, d_vocab, n_ctx)
+        assert QK.shape == (batch_size, n_ctx)
+
+        # Apply causal attention mask
+        causal_mask = torch.tril(torch.ones(n_ctx, n_ctx))  # Creates n_ctx x n_ctx lower triangular matrix
+        # causal_mask = causal_mask.  # Add batch dim: (1, n_ctx, n_ctx)
+        # QK = QK.masked_fill(~causal_mask.bool(), float('-inf'))
+
+        #TODO: do og QK, OV for comparison
+        # out = einsum('batch d_vocab, batch d_vocab d_model ->')
+        # og_QK = (x_query@self.E + self.P_query)@self.Q@self.K.T@(x@self.E+self.P).T
 
         self.EVOU = E_bar @ self.V @ self.O @ self.U
         self.PVOU = P_hat @ self.V @ self.O @ self.U
@@ -130,15 +146,11 @@ class Transformer(torch.nn.Module):
         OV = x @ self.EVOU + self.PVOU
         assert OV.shape == (batch_size, n_ctx, d_vocab)
 
-        self.EU = (E_q @ self.U)
+        self.EU = einsum('batch d_vocab d_model, d_model d_vocab_2 -> batch d_vocab d_vocab_2', E_q, self.U)
         #TODO;l assert direct_path
         # assert self.direct_path.shape == (n_ctx, d_vocab)
-        direct_path = einsum('batch d_vocab, batch d_vocab d_vocab_2 -> batch d_vocab d_vocab_2', x_query, self.EU) # x_query @ self.EU
-        assert direct_path.shape == (batch_size, d_vocab, d_vocab)
-
-        # Apply causal attention mask
-        causal_mask = torch.tril(torch.ones(d_vocab, n_ctx)) # should i do batch_size, d_vocab, n_ctx
-        QK = QK.masked_fill(causal_mask == 0, float('-inf'))
+        direct_path = einsum('batch d_vocab, batch d_vocab d_vocab_2 -> batch d_vocab_2', x_query, self.EU)
+        assert direct_path.shape == (batch_size, d_vocab)
 
         #TODO dim=0, -1 are both n_ctx which do i sum over 
         M = torch.softmax(QK/scaling_factor, dim=-1) @ OV + direct_path
@@ -192,7 +204,7 @@ if __name__ == "__main__":
     print("Training completed.")
     
     # Appendix G.2.3: SVD
-    breakpoint()
+    # breakpoint()
     # U, S, V = torch.svd(model.EQKE)
     # print("EQKE")
     # print(f"Ratio of rank 1 and 2 singular values: {torch.diag(S)[0]/torch.diag(S)[1]}")
