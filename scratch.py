@@ -74,9 +74,6 @@ class Transformer(torch.nn.Module):
         x = F.one_hot(input_ids, num_classes=d_vocab).float()
         assert x.shape == (batch_size, n_ctx, d_vocab)
 
-        x_query = x[:, -1, :] # (batch_size, d_vocab)
-        assert x_query.shape == (batch_size, d_vocab)
-
         P_query = self.P[-1, :]
 
         # dim=-1 => summing across d_model dimension
@@ -102,6 +99,7 @@ class Transformer(torch.nn.Module):
 
         scaling_factor = 1 / math.sqrt(d_model)
 
+
         # Position independent
         #self.EQKE = E_q @ self.Q @ self.K.T @ E_bar.transpose(1, 2)
         self.EQKE = einsum('batch d_vocab d_model, d_model d_model_2 -> batch d_vocab d_model_2', E_q, self.Q)
@@ -117,49 +115,100 @@ class Transformer(torch.nn.Module):
         self.EQKP = einsum('batch d_vocab d_model_2, d_model d_model_2 -> batch d_vocab d_model', self.EQKP, self.K)
         self.EQKP = einsum('batch d_vocab d_model, n_ctx d_model -> batch d_vocab n_ctx', self.EQKP, P_hat)
 
-        assert self.EQKP.shape == (batch_size, d_vocab, n_ctx)   
-
-        breakpoint()
+        assert self.EQKP.shape == (batch_size, d_vocab, n_ctx) 
+  
 
         #QK = x_query @ (self.EQKE @ x.transpose(1, 2) + self.EQKP)
         #QK = einsum('batch d_vocab, batch d_vocab n_ctx -> batch d_vocab n_ctx', x_query, self.EQKE @ x.transpose(1, 2) + self.EQKP)
         QK = einsum('batch d_vocab d_vocab_2, batch n_ctx d_vocab_2 -> batch d_vocab n_ctx', self.EQKE, x) + self.EQKP
+        QK = einsum('batch n_ctx_2 d_vocab, batch_size d_vocab n_ctx -> batch n_ctx_2 n_ctx', x, QK)
         # assert QK.shape == (n_ctx, n_ctx)
         # assert QK.shape == (batch_size, d_vocab, n_ctx)
-        assert QK.shape == (batch_size, n_ctx)
+        assert QK.shape == (batch_size, n_ctx, n_ctx)
 
         # Apply causal attention mask
         causal_mask = torch.tril(torch.ones(n_ctx, n_ctx))  # Creates n_ctx x n_ctx lower triangular matrix
         # causal_mask = causal_mask.  # Add batch dim: (1, n_ctx, n_ctx)
-        # QK = QK.masked_fill(~causal_mask.bool(), float('-inf'))
+        QK = QK.masked_fill(~causal_mask.bool(), float('-inf'))
+
+        QK = QK[:, -1, :]
+
+        assert QK.shape == (batch_size, n_ctx)
 
         #TODO: do og QK, OV for comparison
         # out = einsum('batch d_vocab, batch d_vocab d_model ->')
         # og_QK = (x_query@self.E + self.P_query)@self.Q@self.K.T@(x@self.E+self.P).T
 
-        self.EVOU = E_bar @ self.V @ self.O @ self.U
-        self.PVOU = P_hat @ self.V @ self.O @ self.U
+        #TODO: einsum these mfs
+
+        # self.EVOU = E_bar @ self.V @ self.O @ self.U
+
+        self.EVOU = einsum('batch d_vocab d_model, d_model d_model_2 -> batch d_vocab d_model_2', E_bar, self.V)
+        self.EVOU = einsum('batch d_vocab d_model_2, d_model_2 d_model -> batch d_vocab d_model', self.EVOU, self.O)
+        self.EVOU = einsum('batch d_vocab d_model, d_model d_vocab_2 -> batch d_vocab d_vocab_2', self.EVOU, self.U)
+
         assert self.EVOU.shape == (batch_size, d_vocab, d_vocab)
+
+        self.PVOU = einsum('n_ctx d_model, d_model d_model_2 -> n_ctx d_model_2', P_hat, self.V)
+        self.PVOU = einsum('n_ctx d_model_2, d_model_2 d_model -> n_ctx d_model', self.PVOU, self.O)
+        self.PVOU = einsum('n_ctx d_model, d_model d_vocab -> n_ctx d_vocab', self.PVOU, self.U)
+
         assert self.PVOU.shape == (n_ctx, d_vocab)
 
+        OV = einsum('batch n_ctx d_vocab, batch d_vocab d_vocab_2 -> batch n_ctx d_vocab_2', x, self.EVOU) + self.PVOU
 
-        OV = x @ self.EVOU + self.PVOU
         assert OV.shape == (batch_size, n_ctx, d_vocab)
 
+        x_query = x[:, -1, :] # (batch_size, d_vocab)
+        # assert x_query.shape == (batch_size, d_vocab)
+
         self.EU = einsum('batch d_vocab d_model, d_model d_vocab_2 -> batch d_vocab d_vocab_2', E_q, self.U)
-        #TODO;l assert direct_path
         # assert self.direct_path.shape == (n_ctx, d_vocab)
         direct_path = einsum('batch d_vocab, batch d_vocab d_vocab_2 -> batch d_vocab_2', x_query, self.EU)
         assert direct_path.shape == (batch_size, d_vocab)
 
-        #TODO dim=0, -1 are both n_ctx which do i sum over 
-        M = torch.softmax(QK/scaling_factor, dim=-1) @ OV + direct_path
+        M = einsum('batch n_ctx, batch n_ctx d_vocab -> batch d_vocab', torch.softmax(QK/scaling_factor, dim=-1), OV) + direct_path
         #assert M.shape == (n_ctx, d_vocab)
-        assert M.shape == (batch_size, d_vocab, d_vocab)
+        assert M.shape == (batch_size, d_vocab)
 
-        final_logits = M[:, -1, :]
+        # Calculate mean values of all tensors
+        tensor_means = {
+            # 'QK': QK.mean().item(),
+            'EVOU': self.EVOU.mean().item(),
+            'PVOU': self.PVOU.mean().item(),
+            # 'OV': OV.mean().item(),
+            'EU': self.EU.mean().item(),
+            # 'direct_path': direct_path.mean().item(),
+            # 'M': M.mean().item(),
+            'E_bar': E_bar.mean().item(),
+            'P_bar': P_bar.mean().item(),
+            'P_q': P_q.mean().item(),
+            'E_q': E_q.mean().item(),
+            'P_hat': P_hat.mean().item(),
+            'P': self.P.mean().item(),
+            'E': self.E.mean().item()
+        }
+
+        # Sort the means for consistent plotting
+        sorted_means = sorted(tensor_means.items(), key=lambda x: x[1])
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        y_pos = range(len(sorted_means))
+        values = [mean for _, mean in sorted_means]
+        labels = [name for name, _ in sorted_means]
+
+        ax.plot(values, y_pos, 'bo-')
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels)
+        ax.set_xlabel('Mean Value')
+        ax.set_title('Mean Values of Tensors')
+
+        plt.tight_layout()
+        plt.show()
+
         # l_max = torch.argmax(final_logits)
-        return final_logits
+        return M
 
 
 if __name__ == "__main__":
@@ -205,9 +254,11 @@ if __name__ == "__main__":
     
     # Appendix G.2.3: SVD
     # breakpoint()
-    # U, S, V = torch.svd(model.EQKE)
-    # print("EQKE")
-    # print(f"Ratio of rank 1 and 2 singular values: {torch.diag(S)[0]/torch.diag(S)[1]}")
+    U, S, V = torch.svd(model.EQKE)
+    sigma_1 = torch.diag(S)[0]
+    sigma_2 = torch.diag(S)[1]
+    print("EQKE")
+    print(f"Ratio of rank 1 and 2 singular values: {sigma_1/sigma_2}")
 
     # Save the trained model
     torch.save(model.state_dict(), "trained_transformer.pth")
